@@ -38,8 +38,10 @@ import cryptography.hazmat.primitives.keywrap as crypt
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 
 
+import sqlite3
+
 from scripts.ilapfuncs import get_plist_file_content, get_plist_content, logfunc, \
-    is_platform_windows, open_sqlite_db_readonly, sanitize_file_path
+    is_platform_windows, get_sqlite_db_path, sanitize_file_path
 from scripts.filetype import guess_mime
 
 normcase = lru_cache(maxsize=None)(os.path.normcase)
@@ -455,7 +457,16 @@ class FileSeekerItunes(FileSeekerBase):
     def build_files_list_from_manifest_db(self, manifest_path):
         '''Populates paths from Manifest.db files into _all_files'''
         try:
-            db = open_sqlite_db_readonly(manifest_path)
+            # iOS backups keep Manifest.db in WAL journal mode. The copy read
+            # here is static (often freshly decrypted, with no -wal/-shm
+            # siblings), and a plain read-only connection cannot open a
+            # WAL-marked database because it may not create the -shm file:
+            # connect() succeeds and the first query fails with 'unable to
+            # open database file'. immutable=1 treats the file as unchanging,
+            # skipping WAL/locking machinery entirely.
+            db = sqlite3.connect(
+                f"file:{get_sqlite_db_path(manifest_path)}?mode=ro&immutable=1",
+                uri=True)
             cursor = db.cursor()
             cursor.execute(
                 """
