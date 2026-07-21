@@ -687,12 +687,41 @@ def get_sqlite_db_path(path):
     else:
         return quote(str(path), safe='/')
 
+def _sqlite_wal_sibling_has_frames(path):
+    '''True when a non-empty -wal sibling sits next to the database file.'''
+    wal_path = f"{path}-wal"
+    try:
+        return os.path.exists(wal_path) and os.path.getsize(wal_path) > 0
+    except OSError:
+        return False
+
 def open_sqlite_db_readonly(path):
     '''Opens a sqlite db in read-only mode, so original db (and -wal/journal are intact)'''
     try:
         if path:
-            path = get_sqlite_db_path(path)
-            with sqlite3.connect(f"file:{path}?mode=ro", uri=True) as db:
+            db_uri_path = get_sqlite_db_path(path)
+            db = sqlite3.connect(f"file:{db_uri_path}?mode=ro", uri=True)
+            try:
+                db.execute('SELECT 1 FROM sqlite_master LIMIT 1')
+                return db
+            except sqlite3.OperationalError as probe_error:
+                if 'unable to open database file' not in str(probe_error):
+                    # unrelated problem - hand the connection back so the
+                    # caller surfaces it exactly as before
+                    return db
+                # WAL-marked database: a read-only connection may not create
+                # the -shm shared-memory file, so connect() succeeds and the
+                # first query fails with 'unable to open database file'.
+                # iTunes-backup extractions never carry -wal/-shm siblings,
+                # so there is nothing to replay and an immutable open is
+                # lossless. A non-empty -wal must never be silently ignored
+                # (its frames hold evidence) - keep the original failure.
+                db.close()
+                if _sqlite_wal_sibling_has_frames(path):
+                    raise probe_error
+                db = sqlite3.connect(
+                    f"file:{db_uri_path}?mode=ro&immutable=1", uri=True)
+                db.execute('SELECT 1 FROM sqlite_master LIMIT 1')
                 return db
     except sqlite3.OperationalError as e:
         logfunc(f"Error with {path}:")
@@ -703,8 +732,13 @@ def attach_sqlite_db_readonly(path, db_name):
     '''Return the query to attach a sqlite db in read-only mode.
     path: str --> Path of the SQLite DB to attach
     db_name: str --> Name of the SQLite DB in the query'''
+    uri_options = 'mode=ro'
+    if not _sqlite_wal_sibling_has_frames(path):
+        # see open_sqlite_db_readonly: a WAL-marked file without a usable
+        # -wal/-shm cannot be attached read-only; immutable is lossless here
+        uri_options += '&immutable=1'
     path = get_sqlite_db_path(path)
-    return  f'''ATTACH DATABASE "file:{path}?mode=ro" AS {db_name}'''
+    return  f'''ATTACH DATABASE "file:{path}?{uri_options}" AS {db_name}'''
 
 def get_sqlite_db_records(path, query, attach_query=None):
     db = open_sqlite_db_readonly(path)
